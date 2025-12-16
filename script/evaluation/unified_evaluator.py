@@ -847,6 +847,7 @@ class UnifiedEvaluator:
         use_aligner = (model_type == "rosetta") and (llm_tokenizer is not None)
 
         # Build chat-formatted text
+        # 默认是这里
         if not use_aligner:
             if answer_method == 'logits':
                 text = tokenizer.apply_chat_template(

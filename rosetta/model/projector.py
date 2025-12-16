@@ -1001,8 +1001,20 @@ class C2CProjector(Projector):
         norm_value_scalar = torch.sigmoid(value_scalar)
 
         # Combine (preserve_target_weight=False, add_self=True)
+        # print(f"K: scaler {norm_key_scalar}  gate {key_gate}")
+        # print(f"V: scaler {norm_value_scalar}  gate {value_gate}")
+        # print(f"target_key: {target_key}")
         output_key = target_key + key_gate * norm_key_scalar * projected_key
         output_value = target_value + value_gate * norm_value_scalar * projected_value
+        # print(f"output_key: {output_key}")
+        proj = norm_key_scalar * projected_key
+        target_norm = target_key.norm().item()
+        proj_norm = proj.norm().item()
+        cos = torch.nn.functional.cosine_similarity(
+            target_key.flatten(1), proj.flatten(1), dim=1
+        ).mean().item()
+        # print(f"||target||={target_norm:.1f}, ||proj||={proj_norm:.1f}, ratio={proj_norm/(target_norm+1e-8):.3f}, cos={cos:.3f}")
+
 
         # Expose capture attributes for downstream analysis scripts
         try:
@@ -1017,6 +1029,178 @@ class C2CProjector(Projector):
             pass
 
         return output_key, output_value
+
+
+@register_model
+@capture_init_args
+class PureC2CProjector(Projector):
+    """
+    Concise projector specialized to a fixed C2C configuration using StandardMLP.
+    - Projections: StandardMLP (pre-RMSNorm, SwiGLU, residual per sublayer)
+    - Concat: enabled, followed by linear combiner to target size
+    - Gate: scalar parameter with Gumbel-sigmoid during training
+    - Weights: input-dependent, head_merged granularity using target and projected key
+    - Target preservation: add_self=True, preserve_target_weight=False
+    - Temperatures: annealed gate temperature (1.0 -> 0.001 over 1929 steps), scalar_temperature=1.0
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        intermediate_dim: int = 1024,
+        hidden_dim: int = 1024,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+        initial_temperature: float = 1.0,
+        final_temperature: float = 0.001,
+        anneal_steps: int = 1929,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+
+        assert num_layers >= 3, "num_layers must be >= 3"
+
+        # Dimensions
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+
+        # Sizes
+        in_dim = source_dim * source_num_heads
+        out_dim = target_dim * target_num_heads
+
+        # 1) concat(source_X, target_X) then project to hidden_dim
+        self.key_in = nn.Linear(in_dim , hidden_dim, bias=True, dtype=dtype)
+        self.value_in = nn.Linear(in_dim , hidden_dim, bias=True, dtype=dtype)
+
+        # 2) one-layer common embedding MLP to get intermediate representation (at hidden_dim)
+        self.key_mlp1 = RegularMLP(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_layers=1, dropout=dropout, dtype=dtype)
+        self.value_mlp1 = RegularMLP(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_layers=1, dropout=dropout, dtype=dtype)
+
+        # 3a) intermediate representation → (L-2)-layer MLP for weights → project to head dim
+        self.key_scalar_mlp2 = RegularMLP(hidden_dim=hidden_dim, intermediate_dim=hidden_dim, num_layers=1, dropout=dropout, dtype=dtype)
+        self.value_scalar_mlp2 = RegularMLP(hidden_dim=hidden_dim, intermediate_dim=hidden_dim, num_layers=1, dropout=dropout, dtype=dtype)
+        self.key_scalar_head = nn.Linear(hidden_dim, target_num_heads, dtype=dtype)
+        self.value_scalar_head = nn.Linear(hidden_dim, target_num_heads, dtype=dtype)
+
+        # 3b) intermediate representation → (L-2)-layer MLP for projected_X → finally project hidden_dim → out_dim
+        self.key_proj_mlp2 = RegularMLP(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_layers=num_layers-2, dropout=dropout, dtype=dtype)
+        self.value_proj_mlp2 = RegularMLP(hidden_dim=hidden_dim, intermediate_dim=intermediate_dim, num_layers=num_layers-2, dropout=dropout, dtype=dtype)
+        self.key_proj_out = nn.Linear(hidden_dim, out_dim, bias=True, dtype=dtype)
+        self.value_proj_out = nn.Linear(hidden_dim, out_dim, bias=True, dtype=dtype)
+
+        # Scalar key/value gate parameters and temperature schedule
+        self.key_gate_logit = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+        self.value_gate_logit = nn.Parameter(torch.tensor(0.0, dtype=dtype))
+        self.use_gumbel = True
+        self.register_buffer("gate_temperature", torch.tensor(initial_temperature, dtype=dtype))
+        self.initial_temperature = initial_temperature
+        self.final_temperature = final_temperature
+        self.anneal_steps = anneal_steps
+
+        # Temperature for weight normalization
+        self.scalar_temperature = 1.0
+
+    def update_temperature(self, step: int):
+        ratio = min(step / self.anneal_steps, 1.0)
+        temp = self.initial_temperature * (self.final_temperature / self.initial_temperature) ** ratio
+        self.gate_temperature.fill_(temp)
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Tuple[Tensor, Tensor],
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        source_key, source_value = source_kv
+        target_key, target_value = target_kv
+
+        B, Hs, N, Ds = source_key.shape
+        _, Ht, _, Dt = target_key.shape
+
+        # Flatten heads
+        source_key_flat = source_key.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        source_value_flat = source_value.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        # target_key_flat = target_key.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
+        # target_value_flat = target_value.transpose(1, 2).contiguous().view(B, N, Ht * Dt)
+
+        # 1) concat source and target features along channel
+        key_cat = source_key_flat
+        value_cat = source_value_flat
+
+        # 2) project to hidden dim
+        key_hidden = self.key_in(key_cat)
+        value_hidden = self.value_in(value_cat)
+
+        # 3) one-layer common embedding MLP to get intermediate representation (at hidden_dim)
+        key_hidden = self.key_mlp1(key_hidden)
+        value_hidden = self.value_mlp1(value_hidden)
+
+        # 4b) intermediate representation -> projected feature path
+        key_proj_hidden = self.key_proj_out(self.key_proj_mlp2(key_hidden)) # (B, N, Ht * Dt)
+        value_proj_hidden = self.value_proj_out(self.value_proj_mlp2(value_hidden)) # (B, N, Ht * Dt)
+        projected_key = key_proj_hidden.view(B, N, Ht, Dt).transpose(1, 2) # (B, Ht, N, Dt)
+        projected_value = value_proj_hidden.view(B, N, Ht, Dt).transpose(1, 2) # (B, Ht, N, Dt)
+    
+        # 4a) intermediate representation -> scalar path
+        key_scalar = self.key_scalar_head(self.key_scalar_mlp2(key_hidden))       # (B, N, Ht)
+        value_scalar = self.value_scalar_head(self.value_scalar_mlp2(value_hidden)) # (B, N, Ht)
+        key_scalar = key_scalar.permute(0, 2, 1).unsqueeze(-1)   # (B, Ht, N, 1)
+        value_scalar = value_scalar.permute(0, 2, 1).unsqueeze(-1)  # (B, Ht, N, 1)
+
+        # Key/value gates: element-wise Gumbel noise with scalar logits (broadcast over channels)
+        key_gate_logit = self.key_gate_logit.view(1, 1, 1, 1)
+        value_gate_logit = self.value_gate_logit.view(1, 1, 1, 1)
+        if self.training and self.use_gumbel:
+            u1 = torch.rand(B, Ht, N, 1, device=key_gate_logit.device, dtype=key_gate_logit.dtype)
+            u2 = torch.rand(B, Ht, N, 1, device=value_gate_logit.device, dtype=value_gate_logit.dtype)
+            g1 = -torch.log(-torch.log(u1 + 1e-20) + 1e-20)
+            g2 = -torch.log(-torch.log(u2 + 1e-20) + 1e-20)
+            key_gate = torch.sigmoid((key_gate_logit + g1) / self.gate_temperature)
+            value_gate = torch.sigmoid((value_gate_logit + g2) / self.gate_temperature)
+        else:
+            key_gate = (key_gate_logit > 0).float()
+            value_gate = (value_gate_logit > 0).float()
+
+        # Normalize scalars (scalar_temperature=1.0)
+        norm_key_scalar = torch.sigmoid(key_scalar)
+        norm_value_scalar = torch.sigmoid(value_scalar)
+
+        # Combine (preserve_target_weight=False, add_self=True)
+        # output_key = target_key + key_gate * norm_key_scalar * projected_key
+        # output_value = target_value + value_gate * norm_value_scalar * projected_value
+        output_key = norm_key_scalar * projected_key
+        output_value = norm_value_scalar * projected_value
+
+        proj = norm_key_scalar * projected_key
+        target_norm = target_key.norm().item()
+        proj_norm = proj.norm().item()
+        cos = torch.nn.functional.cosine_similarity(
+            target_key.flatten(1), proj.flatten(1), dim=1
+        ).mean().item()
+        print(f"||target||={target_norm:.1f}, ||proj||={proj_norm:.1f}, ratio={proj_norm/(target_norm+1e-8):.3f}, cos={cos:.3f}")
+
+
+        # Expose capture attributes for downstream analysis scripts
+        try:
+            # Store normalized scalars (detach to avoid autograd, keep device-agnostic via CPU)
+            self.last_norm_key_scalar = norm_key_scalar.detach().cpu()
+            self.last_norm_value_scalar = norm_value_scalar.detach().cpu()
+            # Store gate logits as python floats (parameters are scalar)
+            self.last_key_gate_logit = float(self.key_gate_logit.detach().cpu().item())
+            self.last_value_gate_logit = float(self.value_gate_logit.detach().cpu().item())
+        except Exception:
+            # Best-effort capture; never break forward path
+            pass
+
+        return output_key, output_value
+    
+
 
 def save_projector(obj: Projector, file_path: str) -> None:
     save_object(obj, file_path)

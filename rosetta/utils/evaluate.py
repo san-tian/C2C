@@ -440,6 +440,7 @@ def load_rosetta_model(model_config: Dict[str, Any], eval_config: Dict[str, Any]
         projector_list=projector_list,
         aggregator_list=[],
         multi_source_fusion_mode=multi_source_fusion_mode,
+        skip_base_forward=rosetta_config.get("skip_base_forward", False),
     ).to(device).eval()
 
     # Load projector/aggregator mapping configs from each LLM's checkpoint directory
@@ -726,4 +727,3 @@ def generate_answer_with_generate(model, tokenizer, prompt: str, device: torch.d
     gen_length = generated_ids.shape[0]
 
     return pred, probs, input_length, gen_length, content
-

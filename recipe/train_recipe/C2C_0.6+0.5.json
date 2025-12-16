@@ -1,7 +1,7 @@
 {
     "model": {
-        "base_model": "Qwen/Qwen3-0.6B",
-        "teacher_model": "Qwen/Qwen2.5-0.5B-Instruct",    
+        "base_model": "/data/users/zhujianian/hf/Qwen/Qwen3-0.6B",
+        "teacher_model": "/data/users/zhujianian/hf/Qwen/Qwen2.5-0.5B-Instruct",    
         "is_do_alignment": false,
         "alignment_strategy": "first",
         "projector": {
@@ -34,13 +34,13 @@
         "seed": 42
     },
     "output": {
-        "output_dir": "local/checkpoints/0.6+0.5B_C2C_general_again",
+        "output_dir": "local/checkpoints/0.6+0.5B_C2C_general_initial",
         "save_steps": 500,
         "eval_steps": 100,
         "wandb_config": {
-            "project": "Rosetta",
+            "project": "c2c",
             "mode": "online",
-            "entity": "nics-efc",
+            "entity": "ez4pex-tianjin-university",
             "run_name": "0.6B+0.5B_C2C_general_OpenHermes_500k"
         }
     },

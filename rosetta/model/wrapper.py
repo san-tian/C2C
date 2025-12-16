@@ -47,7 +47,7 @@ class RosettaModel(nn.Module):
     """
     Drop in replacement for the standard transformers LLM models, like Qwen3ForCausalLM
     """
-    def __init__(self, model_list: List[PreTrainedModel], base_model_idx = 0, projector_list: List[Projector] = [], aggregator_list: List[nn.Module] = [], multi_source_fusion_mode: str = "parallel"):
+    def __init__(self, model_list: List[PreTrainedModel], base_model_idx = 0, projector_list: List[Projector] = [], aggregator_list: List[nn.Module] = [], multi_source_fusion_mode: str = "parallel", skip_base_forward: bool = False):
         super().__init__()
         # model list: a list of model, model 0 by default is the base model
         # projector list: a list of projector
@@ -74,6 +74,9 @@ class RosettaModel(nn.Module):
         if multi_source_fusion_mode not in ["sequential", "parallel"]:
             raise ValueError(f"multi_source_fusion_mode must be 'sequential' or 'parallel', got '{multi_source_fusion_mode}'")
         self.multi_source_fusion_mode = multi_source_fusion_mode
+        print(f"RosettaModel initialized with multi_source_fusion_mode={self.multi_source_fusion_mode}")
+        self.skip_base_forward = skip_base_forward
+        print(f"RosettaModel initialized with skip_base_forward={self.skip_base_forward}")
 
     @property
     def device(self):
@@ -276,14 +279,19 @@ class RosettaModel(nn.Module):
         
         curr_base_kv_cache = past_key_values
 
+        # 这个分类就是狗屎，后面那个根本就没用上
         if seqlen >= 1:
+            # print(f"num_sections={num_sections}")  一开始有两个阶段，之后只有一个阶段了
             for i in range(num_sections):
                 start = section_starts[i]
                 end = section_starts[i + 1]
+                # print(f"Processing section {i}: tokens {start} to {end} (length {end - start})")
+                # print(f"kv_cache_index: {kv_cache_index}") decode阶段是 -1，0，prefill是一堆 1，0
                 prefill_input_ids = base_input_ids[:, start:end] if base_input_ids is not None else None
                 prefill_attention_mask = base_attention_mask[:, :end] if base_attention_mask is not None else None
                 prefill_position_ids = position_ids[:, start:end] if position_ids is not None else None
                 prefill_labels = labels[:, start:end] if labels is not None else None
+
 
                 output = self.model_list[self.base_model_idx].forward(
                     input_ids=prefill_input_ids,
@@ -297,6 +305,14 @@ class RosettaModel(nn.Module):
                     *args,
                     **kwargs
                 )
+                # 只把第一次prefill的处理掉
+                if self.skip_base_forward and num_sections > 1 and i == 0:
+                    print("Skipping base model prefill forward output")
+                    pkv = output.past_key_values
+
+                    for ii in range(len(pkv.key_cache)):
+                        pkv.key_cache[ii].zero_()
+                        pkv.value_cache[ii].zero_()
 
                 if self.base_model_idx not in self.kv_cache_dict:
                     self.kv_cache_dict[self.base_model_idx] = {}
@@ -304,8 +320,26 @@ class RosettaModel(nn.Module):
                     self.kv_cache_dict[self.base_model_idx][self.base_model_idx] = None
                 self.kv_cache_dict[self.base_model_idx][self.base_model_idx] = output.past_key_values
 
-                curr_base_kv_cache: DynamicCache = output.past_key_values
+                def cache_summary(cache, layer_idx: int = -1, num_tokens: int = 10, num_dims: int = 20):
+                    """Return a small, human-readable slice of the KV cache to avoid huge dumps."""
+                    key = cache.key_cache[layer_idx]
+                    val = cache.value_cache[layer_idx]
+                    key_sample = key[0, 0, :num_tokens, :num_dims].detach().cpu()
+                    val_sample = val[0, 0, :num_tokens, :num_dims].detach().cpu()
+                    return {
+                        f"layer{layer_idx}": {
+                            "shape": tuple(key.shape),
+                            "key_norm": key.norm().item(),
+                            "val_norm": val.norm().item(),
+                            "key_sample": key_sample.tolist(),
+                            "val_sample": val_sample.tolist(),
+                        }
+                    }
 
+                curr_base_kv_cache: DynamicCache = output.past_key_values
+                # print("before", cache_summary(curr_base_kv_cache))
+
+                # 只在prefill阶段触发
                 if i != num_sections - 1:
                     for source_model_idx in range(1, len(self.model_list)):
                         if self.base_model_idx not in self.kv_cache_dict:
@@ -356,6 +390,8 @@ class RosettaModel(nn.Module):
                 # calculate source model kvcache and apply projections
                 if self.base_model_idx in self.projector_dict:
                     sharer_mask = kv_cache_index[i][0][0][0].item()
+
+                    # 在decode阶段 mask=-1
                     if sharer_mask > 0:
                         base_cache = clone_kv_cache(curr_base_kv_cache)
                         parallel_delta_cache = {} if self.multi_source_fusion_mode == "parallel" else None
@@ -387,6 +423,7 @@ class RosettaModel(nn.Module):
                                     new_source_key_cache = source_key_cache[:, :, start:end, :]
                                     new_source_value_cache = source_value_cache[:, :, start:end, :]
                                     new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
+                                    # 这里放入projector
                                     projected_key, projected_value = self.projector_list[projector_idx].forward(
                                         new_source_kv_cache,
                                         new_base_kv_cache
@@ -425,6 +462,7 @@ class RosettaModel(nn.Module):
                                             torch.zeros_like(new_base_key_cache),
                                             torch.zeros_like(new_base_value_cache),
                                         )
+                                    # 在这里进行projection的注入
                                     delta_key, delta_value = parallel_delta_cache[target_layer_idx]
                                     delta_key = delta_key + (agg_key - new_base_key_cache)
                                     delta_value = delta_value + (agg_value - new_base_value_cache)
@@ -440,9 +478,11 @@ class RosettaModel(nn.Module):
                                 curr_base_kv_cache.value_cache[target_layer_idx][:, :, start:end, :] = base_value_slice + delta_value
 
                     output.past_key_values = curr_base_kv_cache
-                                                                             
+                    # print("after", cache_summary(curr_base_kv_cache))
+                                
         # use base model for decode phase
         else:
+            assert True is False, "Decode phase not implemented yet"
             # Handle list input format for decode phase as well
             decode_input_ids = input_ids[self.base_model_idx] if isinstance(input_ids, list) else input_ids
             decode_attention_mask = attention_mask[self.base_model_idx] if isinstance(attention_mask, list) else attention_mask
@@ -461,6 +501,7 @@ class RosettaModel(nn.Module):
                 *args,
                 **kwargs
             )
+        
         return output
     
     @torch.no_grad()

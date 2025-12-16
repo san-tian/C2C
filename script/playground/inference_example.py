@@ -293,6 +293,7 @@ def load_rosetta_model(model_config: Dict[str, Any], eval_config: Dict[str, Any]
         base_model_idx=0,
         projector_list=projector_list,
         aggregator_list=aggregator_list,
+        skip_base_forward=rosetta_config.get("skip_base_forward", False)
     ).to(device).eval()
 
     # Load projector/aggregator mapping configs

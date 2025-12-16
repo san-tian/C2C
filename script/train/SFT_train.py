@@ -364,7 +364,8 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
             model_list=[base_model, teacher_model],
             base_model_idx=0,
             projector_list=projector_list,
-            aggregator_list=aggregator_list
+            aggregator_list=aggregator_list,
+            skip_base_forward=model_config.get("skip_base_forward", False),
         ).to(device).eval()
         
         
