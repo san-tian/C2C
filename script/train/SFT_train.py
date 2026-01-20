@@ -343,6 +343,7 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
         #     dtype=dtype
         # )
         for _ in range(num_projectors):
+            # print(f"Creating projector {_} with config: source_dim={teacher_dim}, target_dim={base_dim}, source_num_heads={teacher_num_heads}, target_num_heads={base_num_heads}")
             projector = create_projector(
                 projector_config["type"],
                 source_dim=teacher_dim,
@@ -437,7 +438,9 @@ def train_step(model: nn.Module, batch: Dict[str, Any], tokenizer: AutoTokenizer
         position_ids = batch["position_ids"].to(device)
         labels = batch["labels"].to(device)
         kv_cache_index = [x.to(device) for x in batch["kv_cache_index"]]
-        
+        # 在这里都没有报错，进去才报错？
+
+        assert all( len(kv_cache_i)>1  for kv_cache_i in kv_cache_index), "kv_cache_index length error in train_step"
         # Forward pass for Rosetta model
         outputs = model.forward(
             kv_cache_index=kv_cache_index,
@@ -661,6 +664,7 @@ def main():
         if model_config.get("is_do_alignment", False) and aligner is not None:
             full_dataset = AlignedChatDataset(instruct_ds, aligner)
         else:
+            # default
             full_dataset = ChatDataset(instruct_ds, main_tokenizer)
     else:
         raise ValueError(f"Invalid training mode: {training_mode}")
@@ -822,15 +826,50 @@ def main():
             sync_ctx = model.no_sync() if distributed and hasattr(model, "no_sync") and is_accum_step else contextlib.nullcontext()
 
             with sync_ctx:
-                loss = train_step(model, batch, main_tokenizer, training_config["max_length"], device, training_mode)
-                true_loss_value = loss.detach().item()
-                scaled_loss = loss / grad_accum_steps  # Gradient accumulation
-                scaled_loss.backward()
 
-            # accumulate true (unscaled) loss for averaging/printing
-            epoch_loss += true_loss_value
-            accum_true_loss += true_loss_value
-            micro_in_window += 1
+                loss = train_step(model, batch, main_tokenizer, training_config["max_length"], device, training_mode)
+
+                
+
+                # Check for NaN/Inf loss
+
+                true_loss_value = loss.detach().item()
+
+                if math.isnan(true_loss_value) or math.isinf(true_loss_value):
+
+                    if is_main_process:
+
+                        print(f"Warning: Batch {batch_idx} loss is {true_loss_value}. Skipping.")
+
+                    continue  # Skip this batch entirely
+
+                
+
+                scaled_loss = loss / grad_accum_steps  # Gradient accumulation
+
+                
+
+                if scaled_loss.requires_grad:
+
+                    scaled_loss.backward()
+
+                    # Only update statistics if the step was valid
+
+                    epoch_loss += true_loss_value
+
+                    accum_true_loss += true_loss_value
+
+                    micro_in_window += 1
+
+                else:
+
+                    if is_main_process:
+
+                        print(f"Warning: Batch {batch_idx} loss does not require grad (possibly all labels are -100). Skipping backward.")
+
+                    # Do not update statistics for skipped batches to avoid skewing the average
+
+            
 
             # Optimizer step on boundaries or at last batch of the epoch
             did_step = (not is_accum_step) or (batch_idx + 1 == len(train_loader))

@@ -1104,6 +1104,10 @@ class ChatDataset(Dataset):
         # Truncate if necessary
         if len(full_tokens) > self.max_length:
             full_tokens = full_tokens[:self.max_length]
+
+        # 这我新加的
+        if len(instruction_tokens) > self.max_length:
+            instruction_tokens = instruction_tokens[:self.max_length]
         
         # Create labels (-100 for instruction tokens, actual tokens for response)
         labels = [-100] * len(instruction_tokens) + full_tokens[len(instruction_tokens):]
@@ -1341,7 +1345,8 @@ class RosettaDataCollator:
                 'position_ids': normalized_feature['position_ids'][start:end]
             }
             sections.append(section)
-        
+        # 这里没报错，说明数据集都是对的？
+        assert len(sections) >1 , f"Expected multiple sections in the input{kv_idx}"
         return sections
 
     def _pad_sections(self, all_sections: List[List[Dict[str, Any]]]) -> Dict[str, Any]:
@@ -1538,7 +1543,7 @@ class RosettaDataCollator:
                 truncated_section = section[:, :remaining_length]
                 truncated_sections.append(truncated_section)
                 break
-        
+        assert all(len(sec) >1  for sec in truncated_sections), "Truncation error in kv_cache_sections"
         return truncated_sections
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1565,7 +1570,7 @@ class RosettaDataCollator:
         
         # Step 4: Apply length constraints if needed
         output = self._apply_length_constraints(output)
-        
+        assert all(len(sec) >1  for sec in output['kv_cache_index']), "Final output kv_cache_index error"
         return output
 
 

@@ -55,7 +55,9 @@ class RosettaModel(nn.Module):
         # kv-cache dict: key (source_model_idx, target_model_idx), value (Cache), assume only convert at prefill with one type of model
         # projector dict: key (source_model_idx, target_model_idx) value dict(key (source_model_layer_idx, M_target value )
 
+        # base model index 是0
         self.base_model_idx = base_model_idx
+        # 这就俩，一个base，一个teacher
         self.model_list = nn.ModuleList(model_list)
 
         device = model_list[base_model_idx].device
@@ -271,7 +273,8 @@ class RosettaModel(nn.Module):
             _, seqlen = input_ids.size() if input_ids is not None else (0, 0)
 
         num_sections = len(kv_cache_index) if kv_cache_index is not None else 1
-
+        assert num_sections >= 1, "kv_cache_index must have at least one section"
+        assert kv_cache_index is not None # 训练阶段应该没有None的情况
         section_lengths = [kv_cache_index[i].shape[1] for i in range(num_sections)] if kv_cache_index is not None else [seqlen]
         section_starts = [0]
         for l in section_lengths:
@@ -283,64 +286,137 @@ class RosettaModel(nn.Module):
         if seqlen >= 1:
             # print(f"num_sections={num_sections}")  一开始有两个阶段，之后只有一个阶段了
             for i in range(num_sections):
+                # num_sections 是由len(kv_cache_index)决定的，在最外层就写好了
+                # # (1, seq_len - 1, 2)  每一维都是(1,0)
+                # instruction_index = torch.tensor([1, 0], dtype=torch.long).repeat(inputs['input_ids'].shape[1] - 1, 1).unsqueeze(0).to(device)
+                # # (1, 1, 2)
+                # label_index = torch.tensor([-1, 0], dtype=torch.long).repeat(1, 1).unsqueeze(0).to(device)
+                # kv_cache_index = [instruction_index, label_index]
                 start = section_starts[i]
                 end = section_starts[i + 1]
-                # print(f"Processing section {i}: tokens {start} to {end} (length {end - start})")
-                # print(f"kv_cache_index: {kv_cache_index}") decode阶段是 -1，0，prefill是一堆 1，0
+                # 出问题的那个只有一个section
+                # Processing section 0 in 1: tokens 0 to 2048 (length 2048)
+                # print(f"Processing section {i} in {num_sections}: tokens {start} to {end} (length {end - start})")
+                if num_sections ==1 :
+                    '''
+                    这他妈是什么？？？？
+                    kv_cache_index: [tensor([[[ 1,  0],
+                        [ 1,  0],
+                        [ 1,  0],
+                        ...,
+                        [-1, -1],
+                        [-1, -1],
+                        [-1, -1]],
+
+                        [[ 1,  0],
+                        [ 1,  0],
+                        [ 1,  0],
+                        ...,
+                        [-1, -1],
+                        [-1, -1],
+                        [-1, -1]],
+
+                        [[ 1,  0],
+                        [ 1,  0],
+                        [ 1,  0],
+                        ...,
+                        [ 1,  0],
+                        [ 1,  0],
+                        [ 1,  0]],
+
+                        [[ 1,  0],
+                        [ 1,  0],
+                        [ 1,  0],
+                        ...,
+                        [-1, -1],
+                        [-1, -1],
+                        [-1, -1]]], device='cuda:0')]
+                    '''
+                    print(f"kv_cache_index: {kv_cache_index}") #decode阶段是 -1，0，prefill是一堆 1，0
+                    print(f"kv_cache_index: {len(kv_cache_index[0])}") #decode阶段是 -1，0，prefill是一堆 1，0
+
                 prefill_input_ids = base_input_ids[:, start:end] if base_input_ids is not None else None
                 prefill_attention_mask = base_attention_mask[:, :end] if base_attention_mask is not None else None
                 prefill_position_ids = position_ids[:, start:end] if position_ids is not None else None
                 prefill_labels = labels[:, start:end] if labels is not None else None
 
-
-                output = self.model_list[self.base_model_idx].forward(
-                    input_ids=prefill_input_ids,
-                    attention_mask=prefill_attention_mask, 
-                    position_ids=prefill_position_ids,
-                    past_key_values=curr_base_kv_cache,
-                    labels=prefill_labels,
-                    use_cache=use_cache, 
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    *args,
-                    **kwargs
-                )
                 # 只把第一次prefill的处理掉
-                if self.skip_base_forward and num_sections > 1 and i == 0:
-                    print("Skipping base model prefill forward output")
-                    pkv = output.past_key_values
+                if self.skip_base_forward and num_sections > 1 and i == 0: 
+                    # 为什么这里把 i == 0 删了就全是乱码？这两次到底有什么区别
+                    # 如果把第二次的处理掉，说明抛弃了所有的KVCache
+                    # print("Skipping base model prefill forward output")
 
-                    for ii in range(len(pkv.key_cache)):
-                        pkv.key_cache[ii].zero_()
-                        pkv.value_cache[ii].zero_()
-
+                    model = self.model_list[self.base_model_idx]
+                    cfg = model.config
+                    device = model.device
+                    dtype = model.dtype
+                    head_dim = cfg.hidden_size // cfg.num_attention_heads
+                    cache = DynamicCache()
+                    batch_size = prefill_input_ids.shape[0]
+                    seq_len = prefill_input_ids.shape[1]
+                    # print(f" Initializing empty KV cache for base model with num_hidden_layers={cfg.num_hidden_layers},"
+                    #       f" batch_size={batch_size}, seq_len={seq_len}",
+                    #       f" num_key_value_heads={cfg.num_key_value_heads}, head_dim={head_dim}")
+                    for _ in range(cfg.num_hidden_layers):
+                        k = torch.zeros(batch_size, cfg.num_key_value_heads, seq_len, head_dim,
+                                        device=device, dtype=dtype)
+                        v = torch.zeros_like(k)
+                        # print(f'   KV cache layer initialized with shape: {k.shape}')
+                        cache.key_cache.append(k)
+                        cache.value_cache.append(v)
+                    logits = torch.zeros(batch_size, seq_len, model.config.vocab_size,
+                                        device=model.device, dtype=model.dtype)
+                    output = CausalLMOutputWithPast(logits=logits, past_key_values=cache)
+                else:
+                    output = self.model_list[self.base_model_idx].forward(
+                        input_ids=prefill_input_ids,
+                        attention_mask=prefill_attention_mask, 
+                        position_ids=prefill_position_ids,
+                        past_key_values=curr_base_kv_cache,
+                        labels=prefill_labels,
+                        use_cache=use_cache, 
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        *args,
+                        **kwargs
+                    )
                 if self.base_model_idx not in self.kv_cache_dict:
                     self.kv_cache_dict[self.base_model_idx] = {}
                 if self.base_model_idx not in self.kv_cache_dict[self.base_model_idx]:
                     self.kv_cache_dict[self.base_model_idx][self.base_model_idx] = None
                 self.kv_cache_dict[self.base_model_idx][self.base_model_idx] = output.past_key_values
 
-                def cache_summary(cache, layer_idx: int = -1, num_tokens: int = 10, num_dims: int = 20):
-                    """Return a small, human-readable slice of the KV cache to avoid huge dumps."""
-                    key = cache.key_cache[layer_idx]
-                    val = cache.value_cache[layer_idx]
-                    key_sample = key[0, 0, :num_tokens, :num_dims].detach().cpu()
-                    val_sample = val[0, 0, :num_tokens, :num_dims].detach().cpu()
-                    return {
-                        f"layer{layer_idx}": {
-                            "shape": tuple(key.shape),
-                            "key_norm": key.norm().item(),
-                            "val_norm": val.norm().item(),
-                            "key_sample": key_sample.tolist(),
-                            "val_sample": val_sample.tolist(),
-                        }
-                    }
+                # def cache_summary(cache, layer_idx: int = -1, num_tokens: int = 10, num_dims: int = 20):
+                #     """Return a small, human-readable slice of the KV cache to avoid huge dumps."""
+                #     key = cache.key_cache[layer_idx]
+                #     val = cache.value_cache[layer_idx]
+                #     key_sample = key[0, 0, :num_tokens, :num_dims].detach().cpu()
+                #     val_sample = val[0, 0, :num_tokens, :num_dims].detach().cpu()
+                #     return {
+                #         f"layer{layer_idx}": {
+                #             "shape": tuple(key.shape),
+                #             "key_norm": key.norm().item(),
+                #             "val_norm": val.norm().item(),
+                #             "key_sample": key_sample.tolist(),
+                #             "val_sample": val_sample.tolist(),
+                #         }
+                #     }
 
                 curr_base_kv_cache: DynamicCache = output.past_key_values
                 # print("before", cache_summary(curr_base_kv_cache))
 
+                # Determine if we need to compute source KV cache
+                # We need it if:
+                # 1. It's not the last section (legacy/multi-stage logic)
+                # 2. We have a sharer mask > 0, implying we need to project from source models
+                need_source_kv = (i != num_sections - 1)
+                if self.base_model_idx in self.projector_dict:
+                    sharer_mask = kv_cache_index[i][0][0][0].item()
+                    if sharer_mask > 0:
+                        need_source_kv = True
+
                 # 只在prefill阶段触发
-                if i != num_sections - 1:
+                if need_source_kv:
                     for source_model_idx in range(1, len(self.model_list)):
                         if self.base_model_idx not in self.kv_cache_dict:
                             self.kv_cache_dict[self.base_model_idx] = {}
@@ -373,7 +449,7 @@ class RosettaModel(nn.Module):
                                     input_ids=source_prefill_input_ids,
                                     attention_mask=source_prefill_attention_mask,
                                     position_ids=prefill_position_ids,
-                                    past_key_values=self.kv_cache_dict[self.base_model_idx][source_model_idx],
+                                    past_key_values=self.kv_cache_dict[self.base_model_idx][source_model_idx], # 这里传入的一开始是None
                                     use_cache=True,
                                     return_dict=True,
                                 )
@@ -391,8 +467,9 @@ class RosettaModel(nn.Module):
                 if self.base_model_idx in self.projector_dict:
                     sharer_mask = kv_cache_index[i][0][0][0].item()
 
-                    # 在decode阶段 mask=-1
-                    if sharer_mask > 0:
+                    # 只在prefill阶段触发，在decode阶段 mask=-1
+                    # 这里不能直接限制，要不然梯度下降会出问题
+                    if sharer_mask > 0 :
                         base_cache = clone_kv_cache(curr_base_kv_cache)
                         parallel_delta_cache = {} if self.multi_source_fusion_mode == "parallel" else None
                         
@@ -419,7 +496,17 @@ class RosettaModel(nn.Module):
                                 projected_kv_list = []
                                 source_kv_list = []
                                 for source_model_layer_idx, projector_idx in pair_list:
-                                    source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
+                                    # 现在在这报错
+                                    try:
+                                        source_key_cache, source_value_cache = self.kv_cache_dict[self.base_model_idx][source_model_idx][source_model_layer_idx]
+                                    except Exception as e:
+                                        # model 1， layer 4
+                                        # 为什么到这才报错？
+                                        print(f"Error accessing KV cache for source model {source_model_idx}, layer {source_model_layer_idx}")
+                                        # Available KV cache keys: [0]
+                                        print(f"Available KV cache keys: {list(self.kv_cache_dict[self.base_model_idx].keys())}")
+                                        print(f"projector_dict: {self.projector_dict[self.base_model_idx].keys()}")
+                                        raise e
                                     new_source_key_cache = source_key_cache[:, :, start:end, :]
                                     new_source_value_cache = source_value_cache[:, :, start:end, :]
                                     new_source_kv_cache = (new_source_key_cache, new_source_value_cache)
@@ -480,9 +567,9 @@ class RosettaModel(nn.Module):
                     output.past_key_values = curr_base_kv_cache
                     # print("after", cache_summary(curr_base_kv_cache))
                                 
-        # use base model for decode phase
+        # 这段是无效分支，并不是decode
         else:
-            assert True is False, "Decode phase not implemented yet"
+            assert True is False
             # Handle list input format for decode phase as well
             decode_input_ids = input_ids[self.base_model_idx] if isinstance(input_ids, list) else input_ids
             decode_attention_mask = attention_mask[self.base_model_idx] if isinstance(attention_mask, list) else attention_mask

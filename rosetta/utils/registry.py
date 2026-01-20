@@ -246,6 +246,10 @@ def load_object(
         init_args.update(override_args)
 
     cls = get_class_fn(class_name)
+    # Loading object of class PureC2CProjector with args: {'source_dim': 128, 'target_dim': 64, 
+    # 'source_num_heads': 8, 'target_num_heads': 2, 'hidden_dim': 1024, 'intermediate_dim': 1024, 'num_layers': 3, 'dropout': 0.1, 
+    # 'initial_temperature': 1.0, 'final_temperature': 0.001, 'anneal_steps': 1929, 'dtype': torch.bfloat16}
+    # print(f"Loading object of class {class_name} with args: {init_args}")
     return cls(**init_args)
 
 

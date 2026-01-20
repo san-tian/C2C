@@ -1060,6 +1060,9 @@ class PureC2CProjector(Projector):
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
+        # Creating projector with config: source_dim=128, target_dim=64, source_num_heads=8, target_num_heads=2
+        # 这里不该是2啊
+        # print(f"Creating projector with config: source_dim={source_dim}, target_dim={target_dim}, source_num_heads={source_num_heads}, target_num_heads={target_num_heads}")
 
         assert num_layers >= 3, "num_layers must be >= 3"
 
@@ -1072,7 +1075,7 @@ class PureC2CProjector(Projector):
         # Sizes
         in_dim = source_dim * source_num_heads
         out_dim = target_dim * target_num_heads
-
+        # print(f"in_dim={in_dim}, out_dim={out_dim}")
         # 1) concat(source_X, target_X) then project to hidden_dim
         self.key_in = nn.Linear(in_dim , hidden_dim, bias=True, dtype=dtype)
         self.value_in = nn.Linear(in_dim , hidden_dim, bias=True, dtype=dtype)
@@ -1183,7 +1186,7 @@ class PureC2CProjector(Projector):
         cos = torch.nn.functional.cosine_similarity(
             target_key.flatten(1), proj.flatten(1), dim=1
         ).mean().item()
-        print(f"||target||={target_norm:.1f}, ||proj||={proj_norm:.1f}, ratio={proj_norm/(target_norm+1e-8):.3f}, cos={cos:.3f}")
+        # print(f"||target||={target_norm:.1f}, ||proj||={proj_norm:.1f}, ratio={proj_norm/(target_norm+1e-8):.3f}, cos={cos:.3f}")
 
 
         # Expose capture attributes for downstream analysis scripts
@@ -1220,6 +1223,11 @@ def create_projector(projector_type: str, **kwargs) -> Projector:
         An instance of the appropriate projector
     """
     # Prefer using the unified registry getter (handles case-insensitive keys)
+    # Creating projector of type: PureC2CProjector with args: {'source_dim': 128, 'target_dim': 64, 
+    # 'source_num_heads': 8, 'target_num_heads': 2, 'hidden_dim': 1024, 'intermediate_dim': 1024, 'num_layers': 3, 
+    # 'dropout': 0.1, 'initial_temperature': 1.0, 'final_temperature': 0.001, 'anneal_steps': 1929, 'dtype': torch.bfloat16}
+    # print(f"Creating projector of type: {projector_type} with args: {kwargs}")
+    # 创建的时候就是2
     try:
         cls = get_projector_class(projector_type)
     except ValueError as e:

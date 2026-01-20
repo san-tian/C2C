@@ -265,6 +265,7 @@ def load_rosetta_model(model_config: Dict[str, Any], eval_config: Dict[str, Any]
     num_projectors = len([f for f in os.listdir(checkpoint_dir) if re.match(r"projector_\d+\.pt", f)])
     projector_list = []
     for t in range(num_projectors):
+        # json_cfg里面 target num heads就是2
         json_cfg = os.path.join(checkpoint_dir, f"projector_{t}.json")
         proj = load_projector(json_cfg)
         proj = proj.to(device)
